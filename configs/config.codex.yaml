@@ -1,0 +1,97 @@
+# Codex profile against a single local vLLM.
+#
+# Why a dedicated config (not config.minimal.yaml)?
+#   * vLLM enforces `prompt_tokens + max_tokens <= max_model_len`. When codex
+#     omits `max_output_tokens`, the `codex_max_tokens` adapter fills in a
+#     fallback. That fallback must leave headroom for the prompt — set it
+#     just below the model's max_model_len.
+#   * The default circuit breaker opens after 5 failures with 30s cooldown.
+#     Streaming clients (codex) retry aggressively, which can trip it on
+#     transient errors. We raise the threshold so a few flaky requests
+#     don't take the whole backend down.
+#   * Automatic retry with exponential backoff for transient upstream
+#     failures (429, 500, 502, 503, 504, network errors). Non-retryable
+#     errors (400, 401, 403, 404) surface immediately.
+#   * Stream idle timeout aborts streams if vLLM goes silent for too long
+#     (e.g. GPU OOM or kernel hang), preventing codex from hanging forever.
+
+server:
+  host: 0.0.0.0
+  port: 9099
+  log_level: info
+  # Total request timeout in seconds. Used as the default absolute timeout
+  # for streaming when stream_timeout.absolute_timeout_s is 0.
+  request_timeout: 600
+  # How long to let in-flight requests finish when hot-reloading config.
+  # Longer streams need a bigger window; 5s is safe for most codex requests.
+  drain_window_s: 5.0
+  # Reasoning models (Qwen3 think variant, etc.) can stay silent for tens
+  # of seconds while they "think" before emitting any visible token.
+  # Without an SSE keepalive, intermediate hops (load balancers, NAT, the
+  # client's own idle timer) will close the connection and codex shows
+  # "stream disconnected before completion". `: hb\n\n` is a comment frame
+  # that clients ignore but keeps the TCP connection alive.
+  heartbeat:
+    enabled: true
+    interval_s: 5
+    payload: hb
+  # Streaming timeout: abort if the upstream vLLM goes silent (idle) or
+  # the total stream duration exceeds a limit. When a timeout fires, the
+  # proxy synthesizes a `response.completed` with `status=incomplete` so
+  # codex doesn't hang.
+  stream_timeout:
+    idle_timeout_s: 120      # abort if no chunk received for 2 minutes
+    absolute_timeout_s: 0    # 0 = fall back to server.request_timeout (600s)
+
+backends:
+  - name: local-vllm
+    type: vllm
+    base_url: ${UPSTREAM:-http://localhost:8080}
+    auth: { scheme: none }
+    # Connection pool tuning. Default values work for most setups.
+    # connect:
+    #   connect_timeout: 10.0     # TCP connect timeout
+    #   keepalive_expiry: 60.0    # idle keepalive retention
+    #   pool_max_connections: 0   # 0 = auto (max_concurrency * 2, min 64)
+    #   pool_max_keepalive: 0     # 0 = auto (max_concurrency, min 32)
+
+routing:
+  circuit_breaker:
+    # The 4xx-doesn't-count-as-failure fix in pool.use() means real bugs are
+    # the only thing that trips this now, so the upstream default (5/30) is
+    # safe again. Bump only if you see legit 5xx flap on the upstream.
+    failures: 5
+    cooldown_s: 30
+  health_check:
+    # Hysteresis: a single failed probe must NOT flip the backend to
+    # unhealthy — otherwise one keepalive RST during heavy generation makes
+    # every concurrent request 503 for `interval_s` seconds. Two consecutive
+    # failures (≥10s of real downtime) are required; one success recovers.
+    interval_s: 5
+    probe_timeout_s: 2
+    unhealthy_threshold: 2
+    healthy_threshold: 1
+  # Automatic retry for transient upstream failures.
+  # Each retry re-picks a backend and re-acquires the pool slot.
+  # Streaming retries only happen before the first byte is sent.
+  retry:
+    max_retries: 3
+    initial_backoff: 0.5
+    max_backoff: 10.0
+    backoff_multiplier: 2.0
+    retryable_status_codes: [429, 500, 502, 503, 504]
+
+adapters:
+  # Fallback max_tokens for /v1/responses when the client omits
+  # max_output_tokens.
+  #
+  # Default 0 = unset → vLLM picks `max_model_len - prompt_tokens`
+  # automatically, which adapts to every prompt length. This is what you
+  # want for local inference.
+  #
+  # Set a positive integer here only if you need a hard output cap (e.g.
+  # to bound latency or cost). Make sure prompt + cap <= max_model_len.
+  codex_max_tokens:
+    enabled: true
+    options:
+      fallback_max_tokens: 0

@@ -1,0 +1,34 @@
+[Unit]
+Description=backend-proxy (FastAPI proxy for vLLM backends)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# Drop into a service account in production:
+#   User=backend-proxy
+#   Group=backend-proxy
+Environment=PYTHONUNBUFFERED=1
+Environment=BACKEND_PROXY_CONFIG=/etc/backend-proxy/config.yaml
+# Inline streaming nudge: detect "model talks but doesn't act" mid-stream
+# and transparently splice in a nudged second upstream call. Token-by-token
+# streaming is preserved on the happy path. Set to 0 to disable if you want
+# strict pass-through behaviour.
+Environment=BACKEND_PROXY_AUTO_NUDGE=1
+ExecStart=/usr/bin/python3 -m backend_proxy run --config ${BACKEND_PROXY_CONFIG}
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=10
+LimitNOFILE=65536
+
+# Hardening (uncomment if appropriate for your deployment):
+# NoNewPrivileges=true
+# ProtectSystem=strict
+# ProtectHome=true
+# PrivateTmp=true
+# ReadWritePaths=/var/log/backend-proxy
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,36 @@
+# Realistic mixed-backend scenario:
+#   - one local vLLM for coding work
+#   - one local Ollama for cheap general chat
+#   - api.openai.com fallback for proprietary models
+#
+# All three backends use independent API keys. The client never holds any of
+# them — it just hits the proxy with whatever model name it wants.
+
+server:
+  port: 9099
+  log_level: info
+
+backends:
+  - name: local-coder
+    type: vllm
+    base_url: http://127.0.0.1:8080
+    auth: { scheme: none }
+    models: [qwen3-coder-30b]
+
+  - name: local-ollama
+    type: ollama
+    base_url: http://127.0.0.1:11434
+    auth: { scheme: none }
+    models: [llama3.1:8b, mistral:7b]
+
+  - name: openai-cloud
+    type: openai
+    base_url: https://api.openai.com
+    auth:
+      scheme: bearer
+      api_key: ${OPENAI_API_KEY}
+    models: [gpt-4o, gpt-4o-mini, o1, o1-mini]
+
+routing:
+  strategy: model_affinity
+  fallback: round_robin

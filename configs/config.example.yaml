@@ -1,0 +1,155 @@
+# Full configuration showcasing every supported backend type, per-backend
+# auth schemes, multiple instances of the same type, and routing.
+#
+# Validate this file:        backend-proxy check-config -c configs/config.example.yaml
+# Run with this config:      backend-proxy run         -c configs/config.example.yaml
+
+server:
+  host: 0.0.0.0
+  port: 9099
+  workers: 1
+  log_level: info
+  request_timeout: 600
+  cors_allow_origins: ["*"]
+  # How long to let in-flight requests finish when hot-reloading config.
+  # drain_window_s: 2.0
+  # SSE keepalive for long-running streams (reasoning models, etc.).
+  # heartbeat:
+  #   enabled: true
+  #   interval_s: 15
+  #   payload: hb
+  # Streaming timeout: abort if upstream is idle too long or total duration
+  # exceeds a limit. When timeout fires, the proxy synthesizes an incomplete
+  # completion event so the client doesn't hang.
+  # stream_timeout:
+  #   idle_timeout_s: 0        # 0 = disabled; abort if no chunk for N seconds
+  #   absolute_timeout_s: 0    # 0 = fall back to server.request_timeout
+
+backends:
+  # ------------------- vLLM (multiple instances of the same type) -------
+  - name: vllm-coder
+    type: vllm
+    base_url: http://127.0.0.1:8080
+    auth: { scheme: none }                 # local server, no key
+    models: [qwen3-coder-30b]
+    weight: 2
+    max_concurrency: 64
+    # Connection pool tuning (all optional, defaults shown).
+    # connect:
+    #   connect_timeout: 10.0     # TCP connect timeout
+    #   keepalive_expiry: 60.0    # how long idle keepalive connections are kept
+    #   pool_max_connections: 0   # 0 = auto (max_concurrency * 2, min 64)
+    #   pool_max_keepalive: 0     # 0 = auto (max_concurrency, min 32)
+    # Per-backend retry override. Omit to use routing.retry.
+    # retry:
+    #   max_retries: 3
+    #   initial_backoff: 0.5
+    #   max_backoff: 10.0
+    #   backoff_multiplier: 2.0
+    #   retryable_status_codes: [429, 500, 502, 503, 504]
+
+  - name: vllm-think
+    type: vllm
+    base_url: http://127.0.0.1:8081
+    auth:
+      scheme: bearer
+      api_key: ${LOCAL_VLLM_KEY:-}
+    models: [qwen3-think-32b]
+
+  # ------------------- Ollama: native /api/* protocol -------------------
+  - name: ollama-laptop
+    type: ollama
+    base_url: http://192.168.1.10:11434
+    auth: { scheme: none }
+    models: [llama3.1:8b, mistral:7b]
+
+  # ------------------- Ollama: OpenAI-compat /v1/* endpoint -------------
+  # Same Ollama instance, exercised through its OpenAI-compatible API.
+  # Useful for benchmarking the two paths side-by-side.
+  - name: ollama-compat
+    type: ollama-openai
+    base_url: http://192.168.1.10:11434
+    auth: { scheme: none }
+
+  # ------------------- HuggingFace TGI ---------------------------------
+  - name: tgi-staging
+    type: tgi
+    base_url: http://tgi.internal:8080
+    auth:
+      scheme: api_key_header               # custom header name
+      header_name: x-tgi-key
+      api_key: ${TGI_KEY}
+    models: [meta-llama/Meta-Llama-3-70B]
+
+  # ------------------- llama.cpp server.cpp ----------------------------
+  - name: llamacpp-edge
+    type: llamacpp
+    base_url: http://127.0.0.1:9090
+    auth: { scheme: none }
+
+  # ------------------- SGLang -----------------------------------------
+  - name: sglang-router
+    type: sglang
+    base_url: http://sglang.internal:30000
+    auth:
+      scheme: bearer
+      api_key: ${SGLANG_KEY:-}
+
+  # ------------------- OpenAI cloud ------------------------------------
+  - name: openai-cloud
+    type: openai
+    base_url: https://api.openai.com
+    auth:
+      scheme: bearer
+      api_key: ${OPENAI_API_KEY}           # required; expand from env
+    models: [gpt-4o, gpt-4o-mini, o1]
+
+routing:
+  strategy: model_affinity                 # route by `model` first
+  fallback: round_robin                    # otherwise rotate
+  circuit_breaker:
+    failures: 5
+    cooldown_s: 30
+  # Automatic retry for transient upstream failures.
+  # Each retry re-picks a backend and re-acquires the pool slot.
+  # Streaming retries only happen before the first byte is sent.
+  # retry:
+  #   max_retries: 2
+  #   initial_backoff: 0.5
+  #   max_backoff: 8.0
+  #   backoff_multiplier: 2.0
+  #   retryable_status_codes: [429, 500, 502, 503, 504]
+
+adapters:
+  reasoning_think:
+    enabled: true
+    options:
+      open_tag: "<think>\n"
+      close_tag: "\n</think>\n\n"
+  codex_max_tokens:
+    enabled: true
+    options:
+      # 0 (or omit) = let upstream decide; vLLM uses max_model_len - prompt.
+      # Set a positive integer to enforce a hard output cap.
+      fallback_max_tokens: 0
+
+agents:
+  - name: codex
+    match: { path_prefix: /v1/responses }
+    request_adapters:  [responses_to_chat, codex_max_tokens, model_alias]
+    stream_adapters:   [chat_to_responses_stream]
+    response_adapters: [chat_to_responses]
+    model_aliases: { gpt-5-codex: qwen3-coder-30b }
+
+  - name: claude-code
+    match: { path_prefix: /v1/messages }
+    request_adapters:  [anthropic_to_chat, model_alias]
+    stream_adapters:   [chat_to_anthropic_stream]
+    response_adapters: [chat_to_anthropic]
+    model_aliases: { claude-sonnet-4: qwen3-coder-30b }
+
+  - name: opencode
+    match: { default: true }
+    request_adapters: []
+    stream_adapters: []
+    response_adapters: []
